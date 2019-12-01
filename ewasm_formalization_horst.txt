@@ -1,0 +1,1418 @@
+//HoRSt 
+
+/*
+Ewasm v13
+
+Uses the EwasmSelectorFunctionProvider.
+*/
+
+eqtype AbsInt := @T | @V<int>;
+
+
+/* 	machine state {contract_id, pc}: gas, msize, mem, globals, fsize, framestack, tsize, table, stor, cd, ssize, s0, s1, ..., s9
+	fsize is the the current size of the function frame stack  */
+pred MState{int*int}: AbsInt*AbsInt*array<AbsInt>*array<AbsInt>*int*array<array<AbsInt>>*int*array<int>*array<AbsInt>*int*int
+*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt*AbsInt;
+
+/* stack limit error {contract_id}: stack_size */
+pred StackLimitErr{int}: int; 
+
+/* exception state {contract_id}: cd */
+pred Exc{int}: int;
+
+/* halting state {contract_id}: gas, stor, cd, revert */
+pred Halt{int}: AbsInt * array<AbsInt> * int * bool;
+
+
+sel globalInits: int -> [int*int]; /* id -> global, index */
+sel tableInits: int -> [int*int]; /* id -> tableElement, index */
+sel memoryInits: int -> [int*int]; /* id -> memoryDataElement, index */
+sel contractInit: int -> [int*int*int]; /* id -> startpc, msize, tsize */
+sel contractInits: unit -> [int*int*int*int*int]; /* id, startpc, gas, msize, tsize */
+sel interval: int*int -> [int]; /* returns the inclusive interval of the arguments */
+sel contractAndPcForInstruction: int -> [int*int];
+sel contractAndPcAndValueForInstruction: int -> [int*int*int];
+sel callInformation: int -> [int*int*int*int];
+sel callIndirectInformation: int -> [int*int*int*int*bool];
+sel branchInformation: int -> [int*int*int*int*int];
+sel branchTableInformation: int -> [int*int*int*int*int*int];
+sel pcForContractAndOpcode: int*int -> [int];
+
+sel constOps: unit -> [int]; /* returns opcodes of const operations */
+sel cvtOps: unit -> [int]; /* returns opcodes of convert operations */
+sel relOps: unit -> [int]; /* returns opcodes of relational operations */
+sel binOps: unit -> [int]; /* returns opcodes of binary operations */
+sel eeiGetOnePZeroROps: unit -> [int]; /* returns opcodes of eei get operations with 1 parameter, 0 returns */
+sel eeiGetZeroPOneROps: unit -> [int]; /* returns opcodes of eei get operations with 0 parameters, 1 return */
+sel eeiCopyOps: unit -> [int]; /* returns opcodes of eei functions codeCopy, returnDataCopy and callDataCopy */
+
+
+op pow{!n: int} (a: int): int := (!n = 0)?(1):(for (!i: int) in interval(1,!n) : * a); /* returns a^n */
+
+
+const MAX32 := 4294967296; /* 2^32 */
+const MAX64 := 18446744073709551616; /* 2^64 */
+const PAGESIZE := 65536; /* 2^16 */
+
+/* The stack limit has to be increased in case of a stack exception occuring during an analysis */
+const STACKLIMIT := 10;
+
+/*	index for the return pc during a function call
+	arbitrary index which is large enough to be out of reach for local variable declarations
+	(i.e. only if a function would contain RETX number of local variables this index would be too small) */
+const RETX := 1000;
+
+
+/* custom opcodes for EEI functions */
+/* get */
+const EEIGETADDRESS := 512;
+const EEIGETEXTERNALBALANCE := 513;
+const EEIGETBLOCKHASH := 514;
+const EEIGETCALLDATASIZE := 515;
+const EEIGETCALLER := 516;
+const EEIGETCALLVALUE := 517;
+const EEIGETCODESIZE := 518;
+const EEIGETBLOCKCOINBASE := 519;
+const EEIGETBLOCKDIFFICULTY := 520;
+const EEIGETEXTERNALCODESIZE := 521;
+const EEIGETGASLEFT := 522;
+const EEIGETBLOCKGASLIMIT := 523;
+const EEIGETTXGASPRICE := 524;
+const EEIGETBLOCKNUMBER := 525;
+const EEIGETTXORIGIN := 526;
+const EEIGETRETURNDATASIZE := 527;
+const EEIGETBLOCKTIMESTAMP := 528;
+const EEICODECOPY := 529;
+const EEIEXTERNALCODECOPY := 530;
+const EEIRETURNDATACOPY := 531;
+const EEICALLDATACOPY := 532;
+
+/* storage */
+const EEISTORAGESTORE := 533;
+const EEISTORAGELOAD := 534;
+
+/* call */
+const EEICALL := 535;
+const EEICALLCODE := 536;
+const EEICALLDELEGATE := 537;
+const EEICALLSTATIC := 538;
+const EEIFINISH := 539;
+const EEIREVERT := 540;
+
+/* other */
+const EEIUSEGAS := 541;
+const EEILOG := 542;
+const EEISELFDESTRUCT := 543;
+const EEICREATE := 544;
+
+/* general operations */
+op absadd(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x + y) | _ => @T;
+op abssub(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x - y) | _ => @T;
+op absmul(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x * y) | _ => @T;
+op absdiv(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x / y) | _ => @T;
+
+op abslt(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => x < y | _ => true;
+op absle(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => x <= y | _ => true;
+op absgt(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => x > y | _ => true;
+op absge(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => x >= y | _ => true;
+op abseq(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => (x = y) | _ => true;
+op absne(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => (x != y) | _ => true;
+op abseqz(a: AbsInt): AbsInt := match a with | @V(x) => (x = 0) ? (@V(1)) : (@V(0)) | _ => @T;
+
+op storeWrapper(arr:array<AbsInt>, i:int, val:AbsInt) : array<AbsInt> := store arr i val;
+op boolToInt(boolval: bool): int := match boolval with | true => 1 | _ => 0;
+
+
+/* concrete operations for rules */
+op absaddi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V((x + y) mod MAX32) | _ => @T;
+op abssubi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V((x - y + MAX32) mod MAX32) | _ => @T;
+op absmuli32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V((x * y) mod MAX32) | _ => @T;
+op absdivui32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x / y) | _ => @T;
+op abswrapi32(a: AbsInt): AbsInt := match a with | @V(x) => @V(x mod MAX32) | _ => @T;
+op abswrap8(a: AbsInt): AbsInt := match a with | @V(x) => @V(x mod 256) | _ => @T;
+op wrap{!targetwidthbit: int}(a: int): int := a mod pow{!targetwidthbit}(2);
+
+/* sign conversions */
+op fromSignedConcrete{!n: int}(i: int): int := ((i >= 0 && i < pow{!n-1}(2))) ? (i) : (i - pow{!n}(2));
+
+op absFromSignedConcrete{!n: int}(i: int): AbsInt := @V(fromSignedConcrete{!n}(i));
+
+op absFromSigned{!n: int}(i: AbsInt): AbsInt := match i with
+	| @V(iconcrete) => absFromSignedConcrete{!n}(iconcrete)
+	| _ => @T;
+
+/* toSigned is used when value on stack for example (which can be negative) has to be written into memory
+meaning that it has a real sign beforehand (normal int) and is transformed into the signed representation of WASM */
+op toSignedConcrete{!n: int}(i: int): int := ((i >= 0 && i < pow{!n-1}(2))) ? (i) : (i + pow{!n}(2));
+
+
+/* the reason why _s operations do not use a sign operation but _u operations do is as follows:
+normal values (on stack) are AbsInt and can be negative so they are inherently signed and can simply be compared
+for the unsigned operation these AbsInt values have to be transformed into the raw version with toSignedConcrete
+*/
+op abseqi3264(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x = y)) | _ => @T;
+op absnei3264(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x != y)) | _ => @T;
+op absltsi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x < y)) | _ => @T;
+op absltui32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(toSignedConcrete{32}(x) < toSignedConcrete{32}(y))) | _ => @T;
+op absgtsi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x > y)) | _ => @T;
+op absgtui32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(toSignedConcrete{32}(x) > toSignedConcrete{32}(y))) | _ => @T;
+op abslesi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x <= y)) | _ => @T;
+op absleui32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(toSignedConcrete{32}(x) <= toSignedConcrete{32}(y))) | _ => @T;
+op absgesi32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(x >= y)) | _ => @T;
+op absgeui32(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(boolToInt(toSignedConcrete{32}(x) >= toSignedConcrete{32}(y))) | _ => @T;
+
+/* bitwise operations */
+op shl{!width: int}(a: int, b: int): int :=
+	for (!i: int) in interval(0, !width):
+	+ (!i = b) ?
+	((a * pow{!i}(2)) mod pow{!width}(2)) :
+	(0);
+
+op absshl{!width: int}(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(shl{!width}(x, y)) | _ => @T;
+
+op shru{!width: int}(a: int, b: int): int :=
+	for (!i: int) in interval(0, !width):
+	+ (!i = b) ?
+	(a / pow{!i}(2)) :
+	(0);
+
+op absshru{!width: int}(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(shru{!width}(x, y)) | _ => @T;
+
+op absand(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x bvand y) | _ => @T;
+op absor(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x bvor y) | _ => @T;
+op absxor(a: AbsInt, b: AbsInt): AbsInt := match (a, b) with | (@V(x), @V(y)) => @V(x bvxor y) | _ => @T;
+
+/* memory operations */
+op replaceWithTopConcrete{!size : int}(from:int, mem:array<AbsInt>): array<AbsInt> :=
+	for (!a : int) in interval(0, !size - 1): x:array<AbsInt> -> store x (from + !a) @T, mem;
+
+op replaceWithTop{!size : int}(from:AbsInt, mem:array<AbsInt>): array<AbsInt> := match from with
+	| @V(fromconcrete) => replaceWithTopConcrete{!size}(fromconcrete, mem)
+	| _ => [@T];
+
+op absLoadFullConcrete{!widthbit: int}(from:int, mem:array<AbsInt>): AbsInt :=
+	for (!a : int) in interval(0, (!widthbit / 8) - 1): x:AbsInt -> absadd(x, absmul(select mem (from + !a), @V(pow{!a * 8}(2)))), @V(0);
+
+// leading of full type integers (i32, i64)
+op absLoadFull{!widthbit: int}(from:AbsInt, mem:array<AbsInt>): AbsInt := match from with
+	| @V(fromconcrete) => absFromSigned{!widthbit}(absLoadFullConcrete{!widthbit}(fromconcrete, mem))
+	| _ => @T;
+
+op absStoreFullConcrete{!widthbit: int}(from:int, val:int, mem:array<AbsInt>): array<AbsInt> :=
+	for (!a : int) in interval(0, (!widthbit / 8) - 1): x:array<AbsInt> -> storeWrapper(x, (from + !a), @V((val mod pow{(!a + 1) * 8}(2)) / pow{!a * 8}(2))), mem;
+
+// storing of full type integers (i32, i64)
+op absStoreFull{!widthbit: int}(from:AbsInt, val:AbsInt, mem:array<AbsInt>): array<AbsInt> := match (from, val) with
+	| (@V(fromconcrete), @V(valconcrete)) => absStoreFullConcrete{!widthbit}(fromconcrete, toSignedConcrete{!widthbit}(valconcrete), mem)
+	| (@V(fromconcrete), @T) => replaceWithTopConcrete{!widthbit / 8}(fromconcrete, mem)
+	| _ => [@T];
+
+op storeConcrete{!targetwidthbit: int}(from:int, val:int, mem:array<AbsInt>): array<AbsInt> :=
+	for (!a : int) in interval(0, (!targetwidthbit / 8) - 1): x:array<AbsInt> -> storeWrapper(x, (from + !a), @V((val mod pow{(!a + 1) * 8}(2)) / pow{!a * 8}(2))), mem;
+
+op absStoreWrapping{!targetwidthbit: int}(from:AbsInt, val:AbsInt, mem:array<AbsInt>): array<AbsInt> := match (from, val) with
+	| (@V(fromconcrete), @V(valconcrete)) => storeConcrete{!targetwidthbit}(fromconcrete, wrap{!targetwidthbit}(valconcrete), mem)
+	| (@V(fromconcrete), @T) => replaceWithTopConcrete{!targetwidthbit / 8}(fromconcrete, mem)
+	| _ => [@T];
+
+op extractWordFromMemConcrete(from:int, mem:array<AbsInt>): AbsInt :=
+	for (!a : int) in interval(0, 31): x:AbsInt -> absadd(x, absmul(select mem (from + !a), @V(pow{!a * 8}(2)))), @V(0);
+
+op extractWordFromMem(from:AbsInt, mem:array<AbsInt>): AbsInt := match from with
+	| @V(fromconcrete) => extractWordFromMemConcrete(fromconcrete, mem)
+	| _ => @T;
+
+/* storeWrapper is used since normal store results in a parsing error */
+op writeWordToMemConcrete(from:int, val:int, mem:array<AbsInt>): array<AbsInt> :=
+	for (!a : int) in interval(0, 31): x:array<AbsInt> -> storeWrapper(x, (from + !a), @V((val mod pow{(!a + 1) * 8}(2)) / pow{!a * 8}(2))), mem;
+
+op writeWordToMem(from:AbsInt, val:AbsInt, mem:array<AbsInt>): array<AbsInt> := match (from, val) with
+	| (@V(fromconcrete), @V(valconcrete)) => writeWordToMemConcrete(fromconcrete, valconcrete, mem)
+	| (@V(fromconcrete), @T) => replaceWithTopConcrete{32}(fromconcrete, mem)
+	| _ => [@T];
+
+
+/* general helper operations */
+op storeAbs(arr:array<AbsInt>, i:AbsInt, element:AbsInt): array<AbsInt> := match i with
+	| @V(iconcrete) => store arr iconcrete element
+	| _ => [@T];
+
+op selectAbs(arr:array<AbsInt>, i:AbsInt): AbsInt := match i with
+	| @V(iconcrete) => select arr iconcrete
+	| _ => @T;
+
+op selectConcreteArrayAbsIndex(arr:array<int>, i:AbsInt): AbsInt := match i with
+	| @V(iconcrete) => @V(select arr iconcrete)
+	| _ => @T;
+
+op isConcrete(a: AbsInt): bool := match a with | @T => false | _ => true;
+op anyAbstract(a: AbsInt, b: AbsInt): bool := match (a, b) with | (@V(x), @V(y)) => false | _ => true;
+op extractConcrete(a: AbsInt): int := match a with | @V(x) => x | _ => (0-1);
+
+op getAtIndex(idx:int, a: AbsInt, b: AbsInt, c: AbsInt, d: AbsInt, e: AbsInt, f: AbsInt, g: AbsInt, h: AbsInt, i: AbsInt, j: AbsInt): AbsInt :=
+	(idx = 0)?(a):
+	((idx = 1)?(b):
+	((idx = 2)?(c):
+	((idx = 3)?(d):
+	((idx = 4)?(e):
+	((idx = 5)?(f):
+	((idx = 6)?(g):
+	((idx = 7)?(h):
+	((idx = 8)?(i):
+	((idx = 9)?(j):
+	(@T))))))))));
+
+op getInitialGlobals{!id: int}(gv: array<AbsInt>): array<AbsInt> :=
+	for (!global: int, !index: int) in globalInits(!id): x:array<AbsInt> -> store x !index @V(!global), gv;
+
+op getInitialTableElements{!id: int}(table: array<int>): array<int> :=
+	for (!tableelement: int, !index: int) in tableInits(!id): x:array<int> -> store x !index !tableelement, table;
+
+op getInitialMemoryData{!id: int}(mem: array<AbsInt>): array<AbsInt> :=
+	for (!memorydata: int, !index: int) in memoryInits(!id): x:array<AbsInt> -> store x !index @V(!memorydata), mem;
+
+
+/* grouping of multiple instructions */
+op cvtOp(c:int, x:AbsInt): AbsInt := match c with
+	| 167 => abswrapi32(x)
+	| _ => @T;
+
+op relOp(c:int, x:AbsInt, y:AbsInt): AbsInt := match c with
+	| 70 => abseqi3264(x, y)
+	| 71 => absnei3264(x, y)
+	| 72 => absltsi32(x, y)
+	| 73 => absltui32(x, y)
+	| 74 => absgtsi32(x, y)
+	| 75 => absgtui32(x, y)
+	| 76 => abslesi32(x, y)
+	| 77 => absleui32(x, y)
+	| 78 => absgesi32(x, y)
+	| 79 => absgeui32(x, y)
+	| 81 => abseqi3264(x, y)
+	| 82 => absnei3264(x, y)
+	| _ => @T;
+
+op binOp(c:int, x:AbsInt, y:AbsInt): AbsInt := match c with
+	| 106 => absaddi32(x, y)
+	| 107 => abssubi32(x, y)
+	| 108 => absmuli32(x, y)
+	| 113 => absand(x, y)
+	| 114 => absor(x, y)
+	| 115 => absxor(x, y)
+	| 116 => absshl{32}(x, y)
+	| 118 => absshru{32}(x, y)
+	| 131 => absand(x, y)
+	| 132 => absor(x, y)
+	| 133 => absxor(x, y)
+	| 134 => absshl{64}(x, y)
+	| 136 => absshru{64}(x, y)
+	| _ => @T;
+
+
+/* EEI functions, memory return size with 1 parameter and 0 stack returns */
+ op eeiGetOnePZeroRSize(c:int): int := match c with // using constants does not work here?
+	| 512 => 20 // EEIGETADDRESS
+	| 516 => 20 // EEIGETCALLER
+	| 517 => 20 // EEIGETCALLVALUE
+	| 519 => 20 // EEIGETBLOCKCOINBASE
+	| 520 => 32 // EEIGETBLOCKDIFFICULTY
+	| 524 => 16 // EEIGETTXGASPRICE
+	| 526 => 20 // EEIGETTXORIGIN
+	| _ => 0;
+
+
+/*-------------- local machine instruction rules --------------*/
+
+rule unreachable :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(0)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+		=> Exc{!id}(?cd);
+
+
+rule relOpRule :=
+	for (!op:int) in relOps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 2 && ?ns0 = relOp(!op, ?s0, ?s1)) ||
+		(?ssize = 3 && ?ns1 = relOp(!op, ?s1, ?s2) && ?ns0 = ?s0) ||
+		(?ssize = 4 && ?ns2 = relOp(!op, ?s2, ?s3) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 5 && ?ns3 = relOp(!op, ?s3, ?s4) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 6 && ?ns4 = relOp(!op, ?s4, ?s5) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 7 && ?ns5 = relOp(!op, ?s5, ?s6) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 8 && ?ns6 = relOp(!op, ?s6, ?s7) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 9 && ?ns7 = relOp(!op, ?s7, ?s8) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 10 && ?ns8 = relOp(!op, ?s8, ?s9) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule binOpRule :=
+	for (!op:int) in binOps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 2 && ?ns0 = binOp(!op, ?s0, ?s1)) ||
+		(?ssize = 3 && ?ns1 = binOp(!op, ?s1, ?s2) && ?ns0 = ?s0) ||
+		(?ssize = 4 && ?ns2 = binOp(!op, ?s2, ?s3) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 5 && ?ns3 = binOp(!op, ?s3, ?s4) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 6 && ?ns4 = binOp(!op, ?s4, ?s5) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 7 && ?ns5 = binOp(!op, ?s5, ?s6) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 8 && ?ns6 = binOp(!op, ?s6, ?s7) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 9 && ?ns7 = binOp(!op, ?s7, ?s8) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 10 && ?ns8 = binOp(!op, ?s8, ?s9) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule eqzi32 :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(69)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && ?ns0 = abseqz(?s0)) ||
+		(?ssize = 2 && ?ns1 = abseqz(?s1) && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = abseqz(?s2) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = abseqz(?s3) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = abseqz(?s4) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = abseqz(?s5) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = abseqz(?s6) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = abseqz(?s7) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = abseqz(?s8) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = abseqz(?s9) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule divui32 :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(110)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 2 && ?s1 != @V(0) && ?ns0 = absdivui32(?s0, ?s1)) ||
+		(?ssize = 3 && ?s2 != @V(0) && ?ns1 = absdivui32(?s1, ?s2) && ?ns0 = ?s0) ||
+		(?ssize = 4 && ?s3 != @V(0) && ?ns2 = absdivui32(?s2, ?s3) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 5 && ?s4 != @V(0) && ?ns3 = absdivui32(?s3, ?s4) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 6 && ?s5 != @V(0) && ?ns4 = absdivui32(?s4, ?s5) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 7 && ?s6 != @V(0) && ?ns5 = absdivui32(?s5, ?s6) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 8 && ?s7 != @V(0) && ?ns6 = absdivui32(?s6, ?s7) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 9 && ?s8 != @V(0) && ?ns7 = absdivui32(?s7, ?s8) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 10 && ?s9 != @V(0) && ?ns8 = absdivui32(?s8, ?s9) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 2 && (?s1 = @V(0) || ?s1 = @T)) ||
+		(?ssize = 3 && (?s2 = @V(0) || ?s2 = @T)) ||
+		(?ssize = 4 && (?s3 = @V(0) || ?s3 = @T)) ||
+		(?ssize = 5 && (?s4 = @V(0) || ?s4 = @T)) ||
+		(?ssize = 6 && (?s5 = @V(0) || ?s5 = @T)) ||
+		(?ssize = 7 && (?s6 = @V(0) || ?s6 = @T)) ||
+		(?ssize = 8 && (?s7 = @V(0) || ?s7 = @T)) ||
+		(?ssize = 9 && (?s8 = @V(0) || ?s8 = @T)) ||
+		(?ssize = 10 && (?s9 = @V(0) || ?s9 = @T))
+		=> Exc{!id}(?cd);
+
+
+rule consti3264 :=
+	for (!op:int) in constOps(), (!id:int, !pc:int, !val:int) in contractAndPcAndValueForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize < STACKLIMIT, 
+		(?ssize = 0 && ?ns0 = @V(!val)) ||
+		(?ssize = 1 && ?ns1 = @V(!val) && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = @V(!val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize >= STACKLIMIT
+		=> StackLimitErr{!id}(?ssize);
+
+
+rule convert :=
+	for (!op:int) in cvtOps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && ?ns0 = cvtOp(!op, ?s0)) ||
+		(?ssize = 2 && ?ns1 = cvtOp(!op, ?s1) && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = cvtOp(!op, ?s2) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = cvtOp(!op, ?s3) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = cvtOp(!op, ?s4) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = cvtOp(!op, ?s5) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = cvtOp(!op, ?s6) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = cvtOp(!op, ?s7) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = cvtOp(!op, ?s8) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = cvtOp(!op, ?s9) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule drop :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(26)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+	MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+	=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule selectRule :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(27)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		abseq(@V(0), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)),
+		(?ssize = 3 && ?ns0 = ?s1) ||
+		(?ssize = 4 && ?ns1 = ?s2 && ?ns0 = ?s0) ||
+		(?ssize = 5 && ?ns2 = ?s3 && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 6 && ?ns3 = ?s4 && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 7 && ?ns4 = ?s5 && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 8 && ?ns5 = ?s6 && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 9 && ?ns6 = ?s7 && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 10 && ?ns7 = ?s8 && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absne(@V(0), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+
+rule getglobal :=
+	for (!id:int, !pc:int, !index:int) in contractAndPcAndValueForInstruction(23)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize < STACKLIMIT,
+		(?ssize = 0 && ?ns0 = (select ?gv !index)) ||
+		(?ssize = 1 && ?ns1 = (select ?gv !index) && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = (select ?gv !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize >= STACKLIMIT
+		=> StackLimitErr{!id}(?ssize);
+
+
+rule setglobal :=
+	for (!id:int, !pc:int, !index:int) in contractAndPcAndValueForInstruction(24)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && (?val = ?s0)) ||
+		(?ssize = 2 && (?val = ?s1)) ||
+		(?ssize = 3 && (?val = ?s2)) ||
+		(?ssize = 4 && (?val = ?s3)) ||
+		(?ssize = 5 && (?val = ?s4)) ||
+		(?ssize = 6 && (?val = ?s5)) ||
+		(?ssize = 7 && (?val = ?s6)) ||
+		(?ssize = 8 && (?val = ?s7)) ||
+		(?ssize = 9 && (?val = ?s8)) ||
+		(?ssize = 10 && (?val = ?s9))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, (store ?gv !index ?val), ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule block :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(2)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+	MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+	=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule loop :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(3)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+	MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+	=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule end :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(11)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+	MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+	=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule br :=
+	for (!id:int, !pc:int, !targetpc:int, !heightdifference:int, !numpopped:int) in branchInformation(12)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		!numpopped <= 0
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference), ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		!numpopped = 1, // currently at most one due to WASM specification
+		(?ssize = 1 && ?val = ?s0) ||
+		(?ssize = 2 && ?val = ?s1) ||
+		(?ssize = 3 && ?val = ?s2) ||
+		(?ssize = 4 && ?val = ?s3) ||
+		(?ssize = 5 && ?val = ?s4) ||
+		(?ssize = 6 && ?val = ?s5) ||
+		(?ssize = 7 && ?val = ?s6) ||
+		(?ssize = 8 && ?val = ?s7) ||
+		(?ssize = 9 && ?val = ?s8) ||
+		(?ssize = 10 && ?val = ?s9),
+		((?ssize - !heightdifference) = 0 && (?ns0 = ?val)) ||
+		((?ssize - !heightdifference) = 1 && (?ns1 = ?val) && ?ns0 = ?s0) ||
+		((?ssize - !heightdifference) = 2 && (?ns2 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		((?ssize - !heightdifference) = 3 && (?ns3 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		((?ssize - !heightdifference) = 4 && (?ns4 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		((?ssize - !heightdifference) = 5 && (?ns5 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		((?ssize - !heightdifference) = 6 && (?ns6 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		((?ssize - !heightdifference) = 7 && (?ns7 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		((?ssize - !heightdifference) = 8 && (?ns8 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		((?ssize - !heightdifference) = 9 && (?ns9 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference + 1), ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule brtable :=
+	for (!id:int, !pc:int, !targetpc:int, !heightdifference:int, !numpopped:int, !index:int) in branchTableInformation(14)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		!numpopped <= 0,
+		abseq(@V(!index), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference - 1), ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		!numpopped = 1, // currently at most one due to WASM specification
+		abseq(@V(!index), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)),
+		(?ssize = 2 && ?val = ?s0) ||
+		(?ssize = 3 && ?val = ?s1) ||
+		(?ssize = 4 && ?val = ?s2) ||
+		(?ssize = 5 && ?val = ?s3) ||
+		(?ssize = 6 && ?val = ?s4) ||
+		(?ssize = 7 && ?val = ?s5) ||
+		(?ssize = 8 && ?val = ?s6) ||
+		(?ssize = 9 && ?val = ?s7) ||
+		(?ssize = 10 && ?val = ?s8),
+		((?ssize - !heightdifference) = 0 && (?ns0 = ?val)) ||
+		((?ssize - !heightdifference) = 1 && (?ns1 = ?val) && ?ns0 = ?s0) ||
+		((?ssize - !heightdifference) = 2 && (?ns2 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		((?ssize - !heightdifference) = 3 && (?ns3 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		((?ssize - !heightdifference) = 4 && (?ns4 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		((?ssize - !heightdifference) = 5 && (?ns5 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		((?ssize - !heightdifference) = 6 && (?ns6 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		((?ssize - !heightdifference) = 7 && (?ns7 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		((?ssize - !heightdifference) = 8 && (?ns8 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		((?ssize - !heightdifference) = 9 && (?ns9 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference), ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule brif :=
+	for (!id:int, !pc:int, !targetpc:int, !heightdifference:int, !numpopped:int) in branchInformation(13)
+	let
+		macro #GetBranchValue :=
+			(?ssize = 1 && ?branchvalue = ?s0) ||
+			(?ssize = 2 && ?branchvalue = ?s1) ||
+			(?ssize = 3 && ?branchvalue = ?s2) ||
+			(?ssize = 4 && ?branchvalue = ?s3) ||
+			(?ssize = 5 && ?branchvalue = ?s4) ||
+			(?ssize = 6 && ?branchvalue = ?s5) ||
+			(?ssize = 7 && ?branchvalue = ?s6) ||
+			(?ssize = 8 && ?branchvalue = ?s7) ||
+			(?ssize = 9 && ?branchvalue = ?s8) ||
+			(?ssize = 10 && ?branchvalue = ?s9)
+	in
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?branchvalue:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#GetBranchValue,
+		abseq(?branchvalue, @V(0))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?branchvalue:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#GetBranchValue,
+		absne(?branchvalue, @V(0)),
+		!numpopped <= 0
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference), ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt, ?branchvalue:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#GetBranchValue,
+		absne(?branchvalue, @V(0)),
+		!numpopped = 1,
+		(?ssize = 2 && ?val = ?s0) ||
+		(?ssize = 3 && ?val = ?s1) ||
+		(?ssize = 4 && ?val = ?s2) ||
+		(?ssize = 5 && ?val = ?s3) ||
+		(?ssize = 6 && ?val = ?s4) ||
+		(?ssize = 7 && ?val = ?s5) ||
+		(?ssize = 8 && ?val = ?s6) ||
+		(?ssize = 9 && ?val = ?s7) ||
+		(?ssize = 10 && ?val = ?s8),
+		((?ssize - !heightdifference) = 0 && (?ns0 = ?val)) ||
+		((?ssize - !heightdifference) = 1 && (?ns1 = ?val) && ?ns0 = ?s0) ||
+		((?ssize - !heightdifference) = 2 && (?ns2 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		((?ssize - !heightdifference) = 3 && (?ns3 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		((?ssize - !heightdifference) = 4 && (?ns4 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		((?ssize - !heightdifference) = 5 && (?ns5 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		((?ssize - !heightdifference) = 6 && (?ns6 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		((?ssize - !heightdifference) = 7 && (?ns7 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		((?ssize - !heightdifference) = 8 && (?ns8 = ?val) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, (?ssize - !heightdifference +1), ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule if := 
+	for (!id:int, !pc:int, !elsetarget:int) in contractAndPcAndValueForInstruction(4)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		// then branch (stack element != 0)
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && absne(@V(0), ?s0)) ||
+		(?ssize = 2 && absne(@V(0), ?s1)) ||
+		(?ssize = 3 && absne(@V(0), ?s2)) ||
+		(?ssize = 4 && absne(@V(0), ?s3)) ||
+		(?ssize = 5 && absne(@V(0), ?s4)) ||
+		(?ssize = 6 && absne(@V(0), ?s5)) ||
+		(?ssize = 7 && absne(@V(0), ?s6)) ||
+		(?ssize = 8 && absne(@V(0), ?s7)) ||
+		(?ssize = 9 && absne(@V(0), ?s8)) ||
+		(?ssize = 10 && absne(@V(0), ?s9))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		// else branch (stack element = 0)
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && abseq(@V(0), ?s0)) ||
+		(?ssize = 2 && abseq(@V(0), ?s1)) ||
+		(?ssize = 3 && abseq(@V(0), ?s2)) ||
+		(?ssize = 4 && abseq(@V(0), ?s3)) ||
+		(?ssize = 5 && abseq(@V(0), ?s4)) ||
+		(?ssize = 6 && abseq(@V(0), ?s5)) ||
+		(?ssize = 7 && abseq(@V(0), ?s6)) ||
+		(?ssize = 8 && abseq(@V(0), ?s7)) ||
+		(?ssize = 9 && abseq(@V(0), ?s8)) ||
+		(?ssize = 10 && abseq(@V(0), ?s9))
+		=> MState{!id, !elsetarget}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule else :=
+	for (!id:int, !pc:int, !endtarget:int) in contractAndPcAndValueForInstruction(5)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+		=> MState{!id, !endtarget}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule call :=
+	/*	!numparam is the number of parameter values which are taken from the value stack
+		?ts0, ?ts1 ... stands for top stack (i.e. ts0 is the top of the stack, ts1 the second element from the top etc.)
+		?l0, ?l1 ... form the local variables. Based on the !numparam they are either filled with stack values or the value zero */
+	for (!id:int, !pc:int, !numparam:int, !targetpc:int) in callInformation(16)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>, ?newssize:int,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ts0:AbsInt, ?ts1:AbsInt, ?ts2:AbsInt, ?ts3:AbsInt, ?ts4:AbsInt, ?ts5:AbsInt, ?ts6:AbsInt, ?ts7:AbsInt, ?ts8:AbsInt, ?ts9:AbsInt,
+	?l0:AbsInt, ?l1:AbsInt, ?l2:AbsInt, ?l3:AbsInt, ?l4:AbsInt, ?l5:AbsInt, ?l6:AbsInt, ?l7:AbsInt, ?l8:AbsInt, ?l9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 0) ||
+		(?ssize = 1 && ?ts0 = ?s0) ||
+		(?ssize = 2 && ?ts1 = ?s0 && ?ts0 = ?s1) ||
+		(?ssize = 3 && ?ts2 = ?s0 && ?ts1 = ?s1 && ?ts0 = ?s2) ||
+		(?ssize = 4 && ?ts3 = ?s0 && ?ts2 = ?s1 && ?ts1 = ?s2 && ?ts0 = ?s3) ||
+		(?ssize = 5 && ?ts4 = ?s0 && ?ts3 = ?s1 && ?ts2 = ?s2 && ?ts1 = ?s3 && ?ts0 = ?s4) ||
+		(?ssize = 6 && ?ts5 = ?s0 && ?ts4 = ?s1 && ?ts3 = ?s2 && ?ts2 = ?s3 && ?ts1 = ?s4 && ?ts0 = ?s5) ||
+		(?ssize = 7 && ?ts6 = ?s0 && ?ts5 = ?s1 && ?ts4 = ?s2 && ?ts3 = ?s3 && ?ts2 = ?s4 && ?ts1 = ?s5 && ?ts0 = ?s6) ||
+		(?ssize = 8 && ?ts7 = ?s0 && ?ts6 = ?s1 && ?ts5 = ?s2 && ?ts4 = ?s3 && ?ts3 = ?s4 && ?ts2 = ?s5 && ?ts1 = ?s6 && ?ts0 = ?s7) ||
+		(?ssize = 9 && ?ts8 = ?s0 && ?ts7 = ?s1 && ?ts6 = ?s2 && ?ts5 = ?s3 && ?ts4 = ?s4 && ?ts3 = ?s5 && ?ts2 = ?s6 && ?ts1 = ?s7 && ?ts0 = ?s8) ||
+		(?ssize = 10 && ?ts9 = ?s0 && ?ts8 = ?s1 && ?ts7 = ?s2 && ?ts6 = ?s3 && ?ts5 = ?s4 && ?ts4 = ?s5 && ?ts3 = ?s6 && ?ts2 = ?s7 && ?ts1 = ?s8 && ?ts0 = ?s9),
+		(!numparam = 0 && ?l0 = @V(0) && ?l1 = @V(0) && ?l2 = @V(0) && ?l3 = @V(0) && ?l4 = @V(0) && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 1 && ?l0 = ?ts0 && ?l1 = @V(0) && ?l2 = @V(0) && ?l3 = @V(0) && ?l4 = @V(0) && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 2 && ?l0 = ?ts1 && ?l1 = ?ts0 && ?l2 = @V(0) && ?l3 = @V(0) && ?l4 = @V(0) && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 3 && ?l0 = ?ts2 && ?l1 = ?ts1 && ?l2 = ?ts0 && ?l3 = @V(0) && ?l4 = @V(0) && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 4 && ?l0 = ?ts3 && ?l1 = ?ts2 && ?l2 = ?ts1 && ?l3 = ?ts0 && ?l4 = @V(0) && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 5 && ?l0 = ?ts4 && ?l1 = ?ts3 && ?l2 = ?ts2 && ?l3 = ?ts1 && ?l4 = ?ts0 && ?l5 = @V(0) && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 6 && ?l0 = ?ts5 && ?l1 = ?ts4 && ?l2 = ?ts3 && ?l3 = ?ts2 && ?l4 = ?ts1 && ?l5 = ?ts0 && ?l6 = @V(0) && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 7 && ?l0 = ?ts6 && ?l1 = ?ts5 && ?l2 = ?ts4 && ?l3 = ?ts3 && ?l4 = ?ts2 && ?l5 = ?ts1 && ?l6 = ?ts0 && ?l7 = @V(0) && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 8 && ?l0 = ?ts7 && ?l1 = ?ts6 && ?l2 = ?ts5 && ?l3 = ?ts4 && ?l4 = ?ts3 && ?l5 = ?ts2 && ?l6 = ?ts1 && ?l7 = ?ts0 && ?l8 = @V(0) && ?l9 = @V(0)) ||
+		(!numparam = 9 && ?l0 = ?ts8 && ?l1 = ?ts7 && ?l2 = ?ts6 && ?l3 = ?ts5 && ?l4 = ?ts4 && ?l5 = ?ts3 && ?l6 = ?ts2 && ?l7 = ?ts1 && ?l8 = ?ts0 && ?l9 = @V(0)) ||
+		(!numparam = 10 && ?l0 = ?ts9 && ?l1 = ?ts8 && ?l2 = ?ts7 && ?l3 = ?ts6 && ?l4 = ?ts5 && ?l5 = ?ts4 && ?l6 = ?ts3 && ?l7 = ?ts2 && ?l8 = ?ts1 && ?l9 = ?ts0),
+		?newssize = ?ssize - !numparam
+		=> MState{!id, !targetpc}(?gas, ?msize, ?mem, ?gv, (?fsize+1),
+			(store ?fstack ?fsize (store (store (store (store (store (store (store (store (store (store (store [@V(0)] RETX @V(!pc)) 9 ?l9) 8 ?l8) 7 ?l7) 6 ?l6) 5 ?l5) 4 ?l4) 3 ?l3) 2 ?l2) 1 ?l1) 0 ?l0)),
+			?tsize, ?table, ?stor, ?cd, ?newssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule endfunction :=
+	for (!id:int, !pc:int, !targetpc:int) in contractAndPcAndValueForInstruction(267)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		!targetpc = extractConcrete(select (select ?fstack (?fsize-1)) RETX), /* value at index RETX is always concrete */
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+		=> MState{!id, !targetpc+1}(?gas, ?msize, ?mem, ?gv, ?fsize-1, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule getlocal :=
+	for (!id:int, !pc:int, !index:int) in contractAndPcAndValueForInstruction(32)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize < STACKLIMIT,
+		(?ssize = 0 && ?ns0 = (select (select ?fstack (?fsize-1)) !index)) ||
+		(?ssize = 1 && ?ns1 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = (select (select ?fstack (?fsize-1)) !index) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize >= STACKLIMIT
+		=> StackLimitErr{!id}(?ssize);
+
+
+rule setlocal :=
+	for (!id:int, !pc:int, !index:int) in contractAndPcAndValueForInstruction(33)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && (?val = ?s0)) ||
+		(?ssize = 2 && (?val = ?s1)) ||
+		(?ssize = 3 && (?val = ?s2)) ||
+		(?ssize = 4 && (?val = ?s3)) ||
+		(?ssize = 5 && (?val = ?s4)) ||
+		(?ssize = 6 && (?val = ?s5)) ||
+		(?ssize = 7 && (?val = ?s6)) ||
+		(?ssize = 8 && (?val = ?s7)) ||
+		(?ssize = 9 && (?val = ?s8)) ||
+		(?ssize = 10 && (?val = ?s9))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, (store ?fstack (?fsize-1) (store (select ?fstack (?fsize-1)) !index ?val)), ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule teelocal :=
+	for (!id:int, !pc:int, !index:int) in contractAndPcAndValueForInstruction(34)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(?ssize = 1 && (?val = ?s0)) ||
+		(?ssize = 2 && (?val = ?s1)) ||
+		(?ssize = 3 && (?val = ?s2)) ||
+		(?ssize = 4 && (?val = ?s3)) ||
+		(?ssize = 5 && (?val = ?s4)) ||
+		(?ssize = 6 && (?val = ?s5)) ||
+		(?ssize = 7 && (?val = ?s6)) ||
+		(?ssize = 8 && (?val = ?s7)) ||
+		(?ssize = 9 && (?val = ?s8)) ||
+		(?ssize = 10 && (?val = ?s9))
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, (store ?fstack (?fsize-1) (store (select ?fstack (?fsize-1)) !index ?val)), ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+rule loadi32 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(40)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(4)), ?msize),
+		?val = absLoadFull{32}(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?mem),
+		(?ssize = 1 && ?ns0 = ?val) ||
+		(?ssize = 2 && ?ns1 = ?val && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(4)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule loadi64 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(41)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(8)), ?msize),
+		?val = absLoadFull{64}(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?mem),
+		(?ssize = 1 && ?ns0 = ?val) ||
+		(?ssize = 2 && ?ns1 = ?val && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(8)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule loadEightUi32 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(45)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(1)), ?msize),
+		?val = selectAbs(?mem, absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))),
+		(?ssize = 1 && ?ns0 = ?val) ||
+		(?ssize = 2 && ?ns1 = ?val && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = ?val && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(1)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule storei32 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(54)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(4)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+		absStoreFull{32}(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem),
+		?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize - 2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(4)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule storei64 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(55)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(8)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+		absStoreFull{64}(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem),
+		?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize - 2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(8)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule storeEighti32 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(58)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(1)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			storeAbs(?mem, absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), abswrap8(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(1)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule storeSixteeni32 :=
+	for (!id:int, !pc:int, !ooffset:int) in contractAndPcAndValueForInstruction(59)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(2)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			absStoreWrapping{16}(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(absadd(@V(!ooffset), getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), @V(2)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule currentMemory :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(63)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?pages:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?pages = absdiv(?msize, @V(pow{16}(2))),
+		(?ssize = 0 && ?ns0 = ?pages) ||
+		(?ssize = 1 && ?ns1 = ?pages && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = ?pages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule growMemory :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(64)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?pages:AbsInt, ?oldpages:AbsInt, ?growpages:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?oldpages = absdiv(?msize, @V(pow{16}(2))),
+		(?ssize = 1 && ?growpages = ?s0 && ?ns0 = ?oldpages) ||
+		(?ssize = 2 && ?growpages = ?s1 && ?ns1 = ?oldpages && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?growpages = ?s2 && ?ns2 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?growpages = ?s3 && ?ns3 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?growpages = ?s4 && ?ns4 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?growpages = ?s5 && ?ns5 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?growpages = ?s6 && ?ns6 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?growpages = ?s7 && ?ns7 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?growpages = ?s8 && ?ns8 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?growpages = ?s9 && ?ns9 = ?oldpages && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, absadd(?msize, absmul(@V(PAGESIZE), ?growpages)), ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9);
+
+
+rule initializeContracts :=
+	for (!id:int, !startpc:int, !gas:int, !msize:int, !tsize:int) in contractInits()
+	clause[?gv:array<AbsInt>, ?fstack:array<array<AbsInt>>, ?table:array<int>, ?stor:array<AbsInt>, ?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		true
+		=> MState{!id, !startpc}(@V(!gas),
+		@V(!msize), getInitialMemoryData{!id}([@V(0)]),
+		getInitialGlobals{!id}(?gv),
+		1, (store ?fstack 0 (store [@V(0)] RETX @V(0-1))),
+		!tsize, getInitialTableElements{!id}(?table),
+		[@V(0)], 0, 0, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
+
+
+/*-------------- EEI rules --------------*/
+
+rule eeiGetGasLeft :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIGETGASLEFT)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize < STACKLIMIT,
+		(?ssize = 0 && ?ns0 = ?gas) ||
+		(?ssize = 1 && ?ns1 = ?gas && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = ?gas && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize >= STACKLIMIT
+		=> StackLimitErr{!id}(?ssize);
+
+
+rule eeiUseGas := 
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIUSEGAS)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absge(?gas, getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))
+		=> MState{!id, !pc+1}(
+			abssub(?gas, getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)),
+			?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		abslt(?gas, getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9))
+		=> Exc{!id}(?cd);
+
+
+rule eeiGetExternalBalance :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIGETEXTERNALBALANCE)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(16)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			replaceWithTop{16}(
+				getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem
+			),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize) ||
+		absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(16)), ?msize))
+		=> Exc{!id}(?cd);
+
+
+// currently the first two branches are executed (if the memory is in bounds)
+// normally only one branch would be based on the existence of the block
+rule eeiGetBlockHash :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIGETBLOCKHASH)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize),
+		(?ssize = 2 && ?ns0 = @V(0)) ||
+		(?ssize = 3 && ?ns1 = @V(0) && ?ns0 = ?s0) ||
+		(?ssize = 4 && ?ns2 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 5 && ?ns3 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 6 && ?ns4 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 7 && ?ns5 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 8 && ?ns6 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 9 && ?ns7 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 10 && ?ns8 = @V(0) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			replaceWithTop{32}(
+				getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem
+			),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize),
+		(?ssize = 2 && ?ns0 = @V(1)) ||
+		(?ssize = 3 && ?ns1 = @V(1) && ?ns0 = ?s0) ||
+		(?ssize = 4 && ?ns2 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 5 && ?ns3 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 6 && ?ns4 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 7 && ?ns5 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 8 && ?ns6 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 9 && ?ns7 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 10 && ?ns8 = @V(1) && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize) ||
+		absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(16)), ?msize))
+		=> Exc{!id}(?cd);
+
+
+rule eeiGetExternalCodeSize :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIGETEXTERNALCODESIZE)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize),
+		(?ssize = 1 && ?ns0 = @T) ||
+		(?ssize = 2 && ?ns1 = @T && ?ns0 = ?s0) ||
+		(?ssize = 3 && ?ns2 = @T && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 4 && ?ns3 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 5 && ?ns4 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 6 && ?ns5 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 7 && ?ns6 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 8 && ?ns7 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 9 && ?ns8 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 10 && ?ns9 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			replaceWithTop{20}(
+				getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem
+			),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+/* currently there is no other solution for implementing the dynamyic size than setting the memory to [@T]
+
+*/
+rule eeiCopy :=
+	for (!op:int) in eeiCopyOps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+		=> MState{!id, !pc+1}(?gas, ?msize, [@T], ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-3, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+		=> Exc{!id}(?cd);
+
+
+rule eeiStorageStore :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEISTORAGESTORE)
+	let
+		macro #CalculateCAndKeyAndVal :=
+			?c = (absne(?val, @V(0)) && abseq(selectAbs(?stor, ?key), @V(0)))?(@V(20000)):(@V(5000)),
+			?key = extractWordFromMem(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem),
+			?val = extractWordFromMem(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem)
+	in
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?key:AbsInt, ?val:AbsInt, ?c:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#CalculateCAndKeyAndVal,
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize),
+		absle(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize),
+		absge(?gas, ?c)
+		=> MState{!id, !pc+1}(abssub(?gas, ?c), ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, storeAbs(?stor, ?key, ?val), ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?key:AbsInt, ?val:AbsInt, ?c:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#CalculateCAndKeyAndVal,
+		(absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize)) ||
+		(absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize)) ||
+		abslt(?gas, ?c)
+		=> Exc{!id}(?cd);
+
+
+rule eeiStorageLoad :=
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEISTORAGELOAD)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?key:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?key = extractWordFromMem(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize),
+		absle(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			writeWordToMem(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), selectAbs(?stor, ?key), ?mem),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt, ?key:AbsInt, ?val:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		(absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize)) ||
+		(absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(32)), ?msize))
+		=> Exc{!id}(?cd);
+
+
+rule groupEEIGetOnePZeroR :=
+	for (!op:int) in eeiGetOnePZeroROps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(eeiGetOnePZeroRSize(!op))), ?msize)
+		=> MState{!id, !pc+1}(?gas, ?msize,
+			replaceWithTop{eeiGetOnePZeroRSize(!op)}(
+				getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), ?mem
+			),
+			?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(eeiGetOnePZeroRSize(!op))), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule groupEEIGetZeroPOneR :=
+	for (!op:int) in eeiGetZeroPOneROps(), (!id:int, !pc:int) in contractAndPcForInstruction(!op)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize < STACKLIMIT,
+		(?ssize = 0 && ?ns0 = @T) ||
+		(?ssize = 1 && ?ns1 = @T && ?ns0 = ?s0) ||
+		(?ssize = 2 && ?ns2 = @T && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 3 && ?ns3 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 4 && ?ns4 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 5 && ?ns5 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4) ||
+		(?ssize = 6 && ?ns6 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5) ||
+		(?ssize = 7 && ?ns7 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6) ||
+		(?ssize = 8 && ?ns8 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7) ||
+		(?ssize = 9 && ?ns9 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4 && ?ns5 = ?s5 && ?ns6 = ?s6 && ?ns7 = ?s7 && ?ns8 = ?s8)
+		=> MState{!id, !pc+1}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize+1, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		?ssize >= STACKLIMIT
+		=> StackLimitErr{!id}(?ssize);
+
+
+rule eeiLog := 
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEILOG)
+	let
+		macro #GetValuesFromStackAndCalcCost :=
+			?offset = getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?sz = getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?numtopics = getAtIndex(?ssize-3, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?p1 = getAtIndex(?ssize-4, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?p2 = getAtIndex(?ssize-5, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?p3 = getAtIndex(?ssize-6, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?p4 = getAtIndex(?ssize-7, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+			?cost = absadd(absadd(@V(375), absmul(@V(8), ?sz)), absmul(?numtopics, @V(375)))
+
+	in
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?numtopics:AbsInt, ?offset:AbsInt, ?sz:AbsInt,?p1:AbsInt, ?p2:AbsInt, ?p3:AbsInt, ?p4:AbsInt, ?cost:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#GetValuesFromStackAndCalcCost,
+
+		(absle(absadd(?p1, @V(32)), ?msize) || abslt(?numtopics, @V(1))),
+		(absle(absadd(?p2, @V(32)), ?msize) || abslt(?numtopics, @V(2))),
+		(absle(absadd(?p3, @V(32)), ?msize) || abslt(?numtopics, @V(3))),
+		(absle(absadd(?p4, @V(32)), ?msize) || abslt(?numtopics, @V(4))),
+
+		absle(absadd(?offset, ?sz), ?msize),
+		absle(@V(0), ?numtopics),
+		absle(?numtopics, @V(4)),
+		absge(?gas, ?cost)
+
+		=> MState{!id, !pc+1}(abssub(?gas, ?cost), ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize-7, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+		?numtopics:AbsInt, ?offset:AbsInt, ?sz:AbsInt,?p1:AbsInt, ?p2:AbsInt, ?p3:AbsInt, ?p4:AbsInt, ?cost:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#GetValuesFromStackAndCalcCost,
+
+		(absgt(absadd(?offset, ?sz), ?msize)) ||
+		abslt(?numtopics, @V(0)) ||
+		absgt(?numtopics, @V(4)) ||
+		abslt(?gas, ?cost) ||
+		(absgt(absadd(?p1, @V(32)), ?msize) && absge(?numtopics, @V(1))) ||
+		(absgt(absadd(?p2, @V(32)), ?msize) && absge(?numtopics, @V(2))) ||
+		(absgt(absadd(?p3, @V(32)), ?msize) && absge(?numtopics, @V(3))) ||
+		(absgt(absadd(?p4, @V(32)), ?msize) && absge(?numtopics, @V(4)))
+		
+		=> Exc{!id}(?cd);
+
+
+/* gas calculations for call functions ... currently not used since behavior is over-approximated
+op cbase(va:int, flag:int): int := 700 + ((va = 0) ? (0) : (6500)) + ((flag = 0) ? (25000) : (0))
+op cex(va:int, flag:int): int := 700 + ((va = 0) ? (0) : (9000)) + ((flag = 0) ? (25000) : (0))
+op allbutsixtyfourth(n:int): int := n - (n / 64)
+op cgascap(va:int, flag:int, gs, gas): int :=
+	((cex(va, flag) > gas) ? (gs) : ((gs < allbutsixtyfourth(gas - cex(va, flag))) ? (gs) : (allbutsixtyfourth(gas - cex(va, flag)))))
+	+ ((va = 0) ? (0) : (2300))
+*/
+
+rule eeiCall := 
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEICALL),
+	(!startpc:int, !msize:int, !tsize:int) in contractInit(!id)
+	let
+		macro #OutOfBoundsCheckPassed :=
+			absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize),
+			absle(absadd(getAtIndex(?ssize-3, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(16)), ?msize),
+			absle(absadd(getAtIndex(?ssize-4, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+						getAtIndex(?ssize-5, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+	in
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#OutOfBoundsCheckPassed,
+		(?ssize = 5 && ?ns0 = @T) ||
+		(?ssize = 6 && ?ns1 = @T && ?ns0 = ?s0) ||
+		(?ssize = 7 && ?ns2 = @T && ?ns0 = ?s0 && ?ns1 = ?s1) ||
+		(?ssize = 8 && ?ns3 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2) ||
+		(?ssize = 9 && ?ns4 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3) ||
+		(?ssize = 10 && ?ns5 = @T && ?ns0 = ?s0 && ?ns1 = ?s1 && ?ns2 = ?s2 && ?ns3 = ?s3 && ?ns4 = ?s4)
+		=> MState{!id, !pc+1}(@T, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, [@T], ?cd, ?ssize-4, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?ngv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?nfstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt,
+	?ns0:AbsInt, ?ns1:AbsInt, ?ns2:AbsInt, ?ns3:AbsInt, ?ns4:AbsInt, ?ns5:AbsInt, ?ns6:AbsInt, ?ns7:AbsInt, ?ns8:AbsInt, ?ns9:AbsInt, ?cdf:int]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		#OutOfBoundsCheckPassed,
+		?cdf > ?cd
+		=> MState{100, !startpc}(@T,
+			@V(!msize), getInitialMemoryData{!id}([@V(0)]),
+			getInitialGlobals{!id}(?gv),
+			1, (store ?nfstack 0 (store [@V(0)] RETX @V(0-1))),
+			!tsize, getInitialTableElements{!id}(?table),
+			?stor, ?cdf, 0, ?ns0, ?ns1, ?ns2, ?ns3, ?ns4, ?ns5, ?ns6, ?ns7, ?ns8, ?ns9),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)
+			/* instead of checking if the calculated gas c is larger than the available gas it is over-approximated by assuming to fail here 
+			absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(20)), ?msize) ||
+			absgt(absadd(getAtIndex(?ssize-3, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9), @V(16)), ?msize) ||
+			absgt(absadd(getAtIndex(?ssize-4, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+						getAtIndex(?ssize-5, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+			*/
+		=> Exc{!id}(?cd);
+
+
+rule eeiFinish := 
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIFINISH)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+					getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+		=> Halt{!id}(?gas, ?stor, ?cd, false),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+			MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+					getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+		=> Exc{!id}(?cd);
+
+
+rule eeiRevert := 
+	for (!id:int, !pc:int) in contractAndPcForInstruction(EEIREVERT)
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+		MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absle(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+					getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+		=> Halt{!id}(?gas, [@T], ?cd, true),
+	clause[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>,
+	?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+			MState{!id, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+		absgt(absadd(getAtIndex(?ssize-2, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9),
+					getAtIndex(?ssize-1, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9)), ?msize)
+		=> Exc{!id}(?cd);

@@ -1,0 +1,12 @@
+//HoRSt
+
+/*
+Ewasm Test
+
+Uses the EwasmSelectorFunctionProvider.
+*/
+
+test callReentrancy expect UNSAT for (!id:int, !startpc:int, !gas:int, !msize:int, !tsize:int) in contractInits(), (!pc:int) in pcForContractAndOpcode(!id, EEICALL)
+	[?gas:AbsInt, ?msize:AbsInt, ?mem:array<AbsInt>, ?gv:array<AbsInt>, ?stor:array<AbsInt>, ?cd:int, ?ssize:int, ?fsize:int, ?fstack:array<array<AbsInt>>, ?tsize:int, ?table:array<int>, ?s0:AbsInt, ?s1:AbsInt, ?s2:AbsInt, ?s3:AbsInt, ?s4:AbsInt, ?s5:AbsInt, ?s6:AbsInt, ?s7:AbsInt, ?s8:AbsInt, ?s9:AbsInt]
+	?cd > 0,
+	MState{100, !pc}(?gas, ?msize, ?mem, ?gv, ?fsize, ?fstack, ?tsize, ?table, ?stor, ?cd, ?ssize, ?s0, ?s1, ?s2, ?s3, ?s4, ?s5, ?s6, ?s7, ?s8, ?s9);
